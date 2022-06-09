@@ -37,6 +37,8 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.CatalogUtil;
+import org.apache.iceberg.MetadataTableType;
+import org.apache.iceberg.MetadataTableUtils;
 import org.apache.iceberg.MetadataUpdate;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
@@ -54,7 +56,6 @@ import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.hadoop.Configurable;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.ResolvingFileIO;
-import org.apache.iceberg.relocated.com.google.common.base.Joiner;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
@@ -86,7 +87,6 @@ public class RESTSessionCatalog extends BaseSessionCatalog implements Configurab
   private static final List<String> TOKEN_PREFERENCE_ORDER = ImmutableList.of(
       OAuth2Properties.ID_TOKEN_TYPE, OAuth2Properties.ACCESS_TOKEN_TYPE, OAuth2Properties.JWT_TOKEN_TYPE,
       OAuth2Properties.SAML2_TOKEN_TYPE, OAuth2Properties.SAML1_TOKEN_TYPE);
-  private static final Joiner NULL_BYTE = Joiner.on('\u0000');
 
   private final Function<Map<String, String>, RESTClient> clientBuilder;
   private Cache<String, AuthSession> sessions = null;
@@ -209,12 +209,40 @@ public class RESTSessionCatalog extends BaseSessionCatalog implements Configurab
 
   @Override
   public Table loadTable(SessionContext context, TableIdentifier identifier) {
-    LoadTableResponse response = loadInternal(context, identifier);
+    MetadataTableType metadataType;
+    LoadTableResponse response;
+    try {
+      response = loadInternal(context, identifier);
+      metadataType = null;
+
+    } catch (NoSuchTableException original) {
+      metadataType = MetadataTableType.from(identifier.name());
+      if (metadataType != null) {
+        // attempt to load a metadata table using the identifier's namespace as the base table
+        TableIdentifier baseIdent = TableIdentifier.of(identifier.namespace().levels());
+        try {
+          response = loadInternal(context, baseIdent);
+        } catch (NoSuchTableException ignored) {
+          // the base table does not exist
+          throw original;
+        }
+      } else {
+        // name is not a metadata table
+        throw original;
+      }
+    }
+
     Pair<RESTClient, FileIO> clients = tableClients(response.config());
     AuthSession session = tableSession(response.config(), session(context));
     RESTTableOperations ops = new RESTTableOperations(
         clients.first(), paths.table(identifier), session::headers, clients.second(), response.tableMetadata());
-    return new BaseTable(ops, fullTableName(identifier));
+
+    BaseTable table = new BaseTable(ops, fullTableName(identifier));
+    if (metadataType != null) {
+      return MetadataTableUtils.createMetadataTableInstance(table, metadataType);
+    }
+
+    return table;
   }
 
   @Override
@@ -251,7 +279,7 @@ public class RESTSessionCatalog extends BaseSessionCatalog implements Configurab
       queryParams = ImmutableMap.of();
     } else {
       // query params should be unescaped
-      queryParams = ImmutableMap.of("parent", NULL_BYTE.join(namespace.levels()));
+      queryParams = ImmutableMap.of("parent", RESTUtil.NAMESPACE_JOINER.join(namespace.levels()));
     }
 
     ListNamespacesResponse response = client.get(
@@ -339,6 +367,7 @@ public class RESTSessionCatalog extends BaseSessionCatalog implements Configurab
       ScheduledExecutorService service = refreshExecutor;
       this.refreshExecutor = null;
 
+      service.shutdown();
       try {
         if (service.awaitTermination(1, TimeUnit.MINUTES)) {
           LOG.warn("Timed out waiting for refresh executor to terminate");
